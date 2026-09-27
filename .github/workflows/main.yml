@@ -1,90 +1,87 @@
 name: Build PerAppVolume
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      THEOS: /home/runner/theos
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bash \
-            curl \
-            git \
-            make \
-            clang \
-            perl \
-            python3 \
-            xz-utils \
-            unzip
+            bash curl git make clang perl \
+            python3 xz-utils unzip file
 
       - name: Install Theos
         run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          bash -c "$(curl -fsSL \
+            https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
 
       - name: Verify Theos
         run: |
-          echo "=== THEOS ==="
-          echo "$THEOS"
-
-          test -d "$THEOS"
+          echo "THEOS=$THEOS"
           test -f "$THEOS/makefiles/common.mk"
+          echo "[PASS] Theos is installed"
 
-          echo "[PASS] Theos installed"
-
-      - name: Show available SDKs
+      - name: Check project files
         run: |
-          echo "=== SDKs ==="
-          find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" -print || true
+          test -f Makefile
+          test -f PerAppVolume.mm
+          test -f PVGainProcessor.c
+          test -f PVGainProcessor.h
+          echo "[PASS] All source files found"
 
-      - name: Build
+      - name: Build dylib
         run: |
-          test -f Makefile || {
-            echo "::error::Makefile not found"
-            exit 1
-          }
-
-          make clean || true
+          make clean
           make package FINALPACKAGE=1
 
-      - name: Verify build output
+      - name: Verify output
         run: |
-          echo "=== Output files ==="
+          set -eu
+
+          echo "=== Generated files ==="
           find . -type f \
             \( -name "*.dylib" -o -name "*.deb" \) \
             -print
 
-          DYLIB=$(find . -type f -name "*.dylib" | head -1)
+          DYLIB=$(find .theos -type f \
+            -name "PerAppVolume.dylib" | head -n 1)
 
           if [ -z "$DYLIB" ]; then
-            echo "::error::No dylib was produced"
+            echo "::error::PerAppVolume.dylib not found"
             exit 1
           fi
 
-          echo "Testing:"
-          echo "$DYLIB"
-
+          echo "=== Binary information ==="
           file "$DYLIB"
 
-          if file "$DYLIB" | grep -q "Mach-O"; then
-            echo "[PASS] Apple Mach-O detected"
-          else
-            echo "::error::Output is NOT an Apple Mach-O binary"
+          if ! file "$DYLIB" | grep -q "Mach-O"; then
+            echo "::error::Not an Apple Mach-O binary"
             exit 1
           fi
 
-      - name: Upload build artifacts
+          echo "[PASS] Apple Mach-O detected"
+
+          mkdir -p output
+          cp "$DYLIB" output/
+          cp packages/*.deb output/ 2>/dev/null || true
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PerAppVolume-build
-          path: |
-            packages/*
-            .theos/obj/**/*.dylib
+          path: output/*
           if-no-files-found: error
