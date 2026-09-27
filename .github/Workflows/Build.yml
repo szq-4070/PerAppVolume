@@ -11,15 +11,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git \
+            bash \
             curl \
-            wget \
-            clang \
+            git \
             make \
+            clang \
             perl \
             python3 \
             xz-utils \
@@ -27,41 +27,39 @@ jobs:
 
       - name: Install Theos
         run: |
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
 
-      - name: Install Theos dependencies
+      - name: Verify Theos
         run: |
-          bash $HOME/theos/bin/install-theos
+          echo "=== THEOS ==="
+          echo "$THEOS"
 
-      - name: Show environment
+          test -d "$THEOS"
+          test -f "$THEOS/makefiles/common.mk"
+
+          echo "[PASS] Theos installed"
+
+      - name: Show available SDKs
         run: |
-          echo "=== Theos ==="
-          ls -la "$HOME/theos"
-
-          echo "=== Toolchain ==="
-          find "$HOME/theos" -maxdepth 3 \
-            -type f \
-            \( -name "clang" -o -name "ld64" \) \
-            | head -30
+          echo "=== SDKs ==="
+          find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" -print || true
 
       - name: Build
         run: |
-          if [ ! -f Makefile ]; then
+          test -f Makefile || {
             echo "::error::Makefile not found"
             exit 1
-          fi
+          }
 
           make clean || true
-          make FINALPACKAGE=1
+          make package FINALPACKAGE=1
 
-      - name: Verify output
+      - name: Verify build output
         run: |
-          echo "=== Build output ==="
+          echo "=== Output files ==="
           find . -type f \
             \( -name "*.dylib" -o -name "*.deb" \) \
             -print
-
-          echo "=== Mach-O verification ==="
 
           DYLIB=$(find . -type f -name "*.dylib" | head -1)
 
@@ -70,19 +68,23 @@ jobs:
             exit 1
           fi
 
+          echo "Testing:"
+          echo "$DYLIB"
+
           file "$DYLIB"
 
           if file "$DYLIB" | grep -q "Mach-O"; then
-            echo "[PASS] Mach-O detected"
+            echo "[PASS] Apple Mach-O detected"
           else
             echo "::error::Output is NOT an Apple Mach-O binary"
             exit 1
           fi
 
-      - name: Upload dylib
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PerAppVolume-dylib
+          name: PerAppVolume-build
           path: |
-            **/*.dylib
+            packages/*
+            .theos/obj/**/*.dylib
           if-no-files-found: error
