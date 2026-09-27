@@ -1,0 +1,88 @@
+name: Build PerAppVolume
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            clang \
+            make \
+            perl \
+            python3 \
+            xz-utils \
+            unzip
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+
+      - name: Install Theos dependencies
+        run: |
+          bash $HOME/theos/bin/install-theos
+
+      - name: Show environment
+        run: |
+          echo "=== Theos ==="
+          ls -la "$HOME/theos"
+
+          echo "=== Toolchain ==="
+          find "$HOME/theos" -maxdepth 3 \
+            -type f \
+            \( -name "clang" -o -name "ld64" \) \
+            | head -30
+
+      - name: Build
+        run: |
+          if [ ! -f Makefile ]; then
+            echo "::error::Makefile not found"
+            exit 1
+          fi
+
+          make clean || true
+          make FINALPACKAGE=1
+
+      - name: Verify output
+        run: |
+          echo "=== Build output ==="
+          find . -type f \
+            \( -name "*.dylib" -o -name "*.deb" \) \
+            -print
+
+          echo "=== Mach-O verification ==="
+
+          DYLIB=$(find . -type f -name "*.dylib" | head -1)
+
+          if [ -z "$DYLIB" ]; then
+            echo "::error::No dylib was produced"
+            exit 1
+          fi
+
+          file "$DYLIB"
+
+          if file "$DYLIB" | grep -q "Mach-O"; then
+            echo "[PASS] Mach-O detected"
+          else
+            echo "::error::Output is NOT an Apple Mach-O binary"
+            exit 1
+          fi
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerAppVolume-dylib
+          path: |
+            **/*.dylib
+          if-no-files-found: error
