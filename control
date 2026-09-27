@@ -1,0 +1,8 @@
+Package: com.szq.perappvolume
+Name: PerAppVolume
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Per-app internal audio volume control
+Maintainer: szq
+Author: szq
+Section: Tweaks
