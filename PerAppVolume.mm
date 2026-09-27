@@ -6,7 +6,7 @@
 
 static NSString * const PVDefaultsKey = @"com.szq.perappvolume.settings";
 static const void *PVOriginalVolumeKey = &PVOriginalVolumeKey;
-static BOOL PVEnabled=YES, PVStereo=NO, PVFloatingEnabled=NO, PVOverVolume=NO, PVBackgroundAudio=NO, PVMutedd=NO;
+static BOOL PVEnabled=YES, PVStereo=NO, PVFloatingEnabled=NO, PVOverVolume=NO, PVBackgroundAudio=NO, PVMuted=NO;
 static float PVGain=1.0f, PVLeft=1.0f, PVRight=1.0f;
 static NSHashTable<AVAudioPlayer *> *PVAudioPlayers;
 static NSHashTable<AVPlayer *> *PVPlayers;
@@ -18,10 +18,10 @@ static void PVLoad(void){
  NSDictionary*d=[[NSUserDefaults standardUserDefaults] dictionaryForKey:PVDefaultsKey]; if(![d isKindOfClass:NSDictionary.class])return;
  PVEnabled=d[@"enabled"]?[d[@"enabled"] boolValue]:YES; PVGain=PVClamp([d[@"gain"] floatValue],2);
  PVStereo=[d[@"stereo"] boolValue]; PVLeft=PVClamp(d[@"left"]?[d[@"left"] floatValue]:1,2); PVRight=PVClamp(d[@"right"]?[d[@"right"] floatValue]:1,2);
- PVFloatingEnabled=[d[@"floating"] boolValue]; PVOverVolume=[d[@"over"] boolValue]; PVBackgroundAudio=[d[@"background"] boolValue]; PVMutedd=[d[@"muted"] boolValue];
+ PVFloatingEnabled=[d[@"floating"] boolValue]; PVOverVolume=[d[@"over"] boolValue]; PVBackgroundAudio=[d[@"background"] boolValue]; PVMuted=[d[@"muted"] boolValue];
 }
 static void PVSave(void){ [[NSUserDefaults standardUserDefaults] setObject:@{@"enabled":@(PVEnabled),@"gain":@(PVGain),@"stereo":@(PVStereo),@"left":@(PVLeft),@"right":@(PVRight),@"floating":@(PVFloatingEnabled),@"over":@(PVOverVolume),@"background":@(PVBackgroundAudio),@"muted":@(PVMuted)} forKey:PVDefaultsKey]; }
-static float PVApplied(float v){ if(PVMutedd)return 0; float gain=PVEnabled?PVGain:1; return PVClamp(v*gain,PVOverVolume?2:1); }
+static float PVApplied(float v){ if(PVMuted)return 0; float gain=PVEnabled?PVGain:1; return PVClamp(v*gain,PVOverVolume?2:1); }
 @interface AVAudioPlayer(PVHook)
 -(void)pv_original_setVolume:(float)v;
 @end
@@ -86,7 +86,7 @@ static UIButton *PVButton(NSString*s){UIButton*b=[UIButton buttonWithType:UIButt
 @end
 @implementation PVBall
 -(instancetype)init{if((self=[super initWithFrame:CGRectMake(0,0,54,54)])){self.backgroundColor=[UIColor colorWithRed:.24 green:.25 blue:.85 alpha:.9];self.layer.cornerRadius=27;self.layer.borderWidth=1;self.layer.borderColor=UIColor.whiteColor.CGColor;UILabel*l=PVLabel(@"音",22,UIFontWeightBold,UIColor.whiteColor);l.frame=self.bounds;l.textAlignment=NSTextAlignmentCenter;[self addSubview:l];UITapGestureRecognizer*t=[[UITapGestureRecognizer alloc]initWithTarget:self action:@selector(open)];[self addGestureRecognizer:t];}return self;}
--(void)open{PVShowPanel;}
+-(void)open{PVShowPanel();}
 @end
 static void PVUpdateBall(void){if(!PVFloatingEnabled){PVBallWindow.hidden=YES;return;}UIWindowScene*s=PVScene();if(!s)return;if(!PVBallWindow){PVBallWindow=[[UIWindow alloc]initWithWindowScene:s];PVBallWindow.windowLevel=UIWindowLevelAlert+1;PVBallWindow.backgroundColor=UIColor.clearColor;PVBallWindow.rootViewController=[UIViewController new];PVBallWindow.rootViewController.view.backgroundColor=UIColor.clearColor;[PVBallWindow.rootViewController.view addSubview:[PVBall new]];}PVBallWindow.frame=CGRectMake(0,0,54,54);PVBallWindow.center=CGPointMake(s.coordinateSpace.bounds.size.width-45,s.coordinateSpace.bounds.size.height/2);PVBallWindow.hidden=NO;}
 static void PVShowPanel(void){if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{PVShowPanel();});return;}UIWindowScene*s=PVScene();if(!s)return;if(!PVWindow||PVWindow.windowScene!=s){PVWindow=[[UIWindow alloc]initWithWindowScene:s];PVWindow.windowLevel=UIWindowLevelAlert;PVWindow.backgroundColor=UIColor.clearColor;PVWindow.rootViewController=[PVPanel new];}PVWindow.frame=CGRectMake(0,0,340,300);PVWindow.center=CGPointMake(s.coordinateSpace.bounds.size.width/2,s.coordinateSpace.bounds.size.height/2);PVWindow.hidden=NO;[PVWindow makeKeyAndVisible];PVUpdateBall();}
