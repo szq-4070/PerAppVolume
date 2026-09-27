@@ -1,325 +1,134 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <MediaPlayer/MediaPlayer.h>
 #import <objc/runtime.h>
-
-#pragma mark - Persistent settings
+#import <math.h>
 
 static NSString * const PVDefaultsKey = @"com.szq.perappvolume.settings";
 static NSString * const PVEnabledKey = @"enabled";
-static NSString * const PVMasterKey = @"master";
-static NSString * const PVLeftKey = @"left";
-static NSString * const PVRightKey = @"right";
-static NSString * const PVBalanceKey = @"stereo";
-
+static NSString * const PVGainKey = @"gain";
+static const void *PVOriginalVolumeKey = &PVOriginalVolumeKey;
 static BOOL PVEnabled = YES;
-static float PVMaster = 1.0f;
-static float PVLeft = 1.0f;
-static float PVRight = 1.0f;
-static BOOL PVStereo = NO;
+static float PVGain = 1.0f;
+static BOOL PVHooksInstalled = NO;
+static NSHashTable<AVAudioPlayer *> *PVAudioPlayers;
+static NSHashTable<AVPlayer *> *PVPlayers;
 
-static float PVClamp(float value) {
-    if (!isfinite(value)) return 1.0f;
-    return fminf(2.0f, fmaxf(0.0f, value));
+static float PVClamp(float v) {
+    if (!isfinite(v)) return 1.0f;
+    return fminf(1.0f, fmaxf(0.0f, v));
 }
-
-static void PVLoadSettings(void) {
+static void PVLoad(void) {
     NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:PVDefaultsKey];
     if (![d isKindOfClass:NSDictionary.class]) return;
     PVEnabled = d[PVEnabledKey] ? [d[PVEnabledKey] boolValue] : YES;
-    PVMaster = PVClamp(d[PVMasterKey] ? [d[PVMasterKey] floatValue] : 1.0f);
-    PVLeft = PVClamp(d[PVLeftKey] ? [d[PVLeftKey] floatValue] : 1.0f);
-    PVRight = PVClamp(d[PVRightKey] ? [d[PVRightKey] floatValue] : 1.0f);
-    PVStereo = d[PVBalanceKey] ? [d[PVBalanceKey] boolValue] : NO;
+    PVGain = PVClamp(d[PVGainKey] ? [d[PVGainKey] floatValue] : 1.0f);
 }
-
-static void PVSaveSettings(void) {
-    NSDictionary *d = @{
-        PVEnabledKey: @(PVEnabled),
-        PVMasterKey: @(PVMaster),
-        PVLeftKey: @(PVLeft),
-        PVRightKey: @(PVRight),
-        PVBalanceKey: @(PVStereo)
-    };
-    [[NSUserDefaults standardUserDefaults] setObject:d forKey:PVDefaultsKey];
+static void PVSave(void) {
+    [[NSUserDefaults standardUserDefaults] setObject:@{PVEnabledKey:@(PVEnabled), PVGainKey:@(PVGain)} forKey:PVDefaultsKey];
 }
+static float PVApplied(float original) { return PVEnabled ? PVClamp(original * PVGain) : PVClamp(original); }
 
-static float PVGainForChannel(BOOL right) {
-    if (!PVEnabled) return 1.0f;
-    if (!PVStereo) return PVMaster;
-    return PVClamp((right ? PVRight : PVLeft) * PVMaster);
+@interface AVAudioPlayer (PVHook)
+- (void)pv_original_setVolume:(float)value;
+@end
+@implementation AVAudioPlayer (PVHook)
+- (void)pv_original_setVolume:(float)value {
+    objc_setAssociatedObject(self, PVOriginalVolumeKey, @(PVClamp(value)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self pv_original_setVolume:PVApplied(value)];
+    [PVAudioPlayers addObject:self];
 }
+@end
 
-#pragma mark - Runtime hooks
-/*
- The hooks affect volume values supplied through AVAudioPlayer and AVPlayer.
- They do not intercept every CoreAudio, AudioQueue, WebRTC, game-engine, or
- system-managed audio path. A successful hook is not proof that a given app's
- audible output is controlled.
- */
+@interface AVPlayer (PVHook)
+- (void)pv_original_setVolume:(float)value;
+@end
+@implementation AVPlayer (PVHook)
+- (void)pv_original_setVolume:(float)value {
+    objc_setAssociatedObject(self, PVOriginalVolumeKey, @(PVClamp(value)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self pv_original_setVolume:PVApplied(value)];
+    [PVPlayers addObject:self];
+}
+@end
 
-static void PVSwizzleInstanceMethod(Class cls, SEL original, SEL replacement) {
-    Method a = class_getInstanceMethod(cls, original);
-    Method b = class_getInstanceMethod(cls, replacement);
+static void PVSwizzle(Class cls, SEL original, SEL replacement) {
+    Method a = class_getInstanceMethod(cls, original), b = class_getInstanceMethod(cls, replacement);
     if (!a || !b) return;
-
-    BOOL added = class_addMethod(cls, original, method_getImplementation(b),
-                                 method_getTypeEncoding(b));
-    if (added) {
-        class_replaceMethod(cls, replacement, method_getImplementation(a),
-                            method_getTypeEncoding(a));
-    } else {
-        method_exchangeImplementations(a, b);
+    method_exchangeImplementations(a, b);
+}
+static void PVRefreshPlayers(void) {
+    for (AVAudioPlayer *p in PVAudioPlayers.allObjects) {
+        NSNumber *n = objc_getAssociatedObject(p, PVOriginalVolumeKey);
+        if (n) [p pv_original_setVolume:PVApplied(n.floatValue)];
+    }
+    for (AVPlayer *p in PVPlayers.allObjects) {
+        NSNumber *n = objc_getAssociatedObject(p, PVOriginalVolumeKey);
+        if (n) [p pv_original_setVolume:PVApplied(n.floatValue)];
     }
 }
-
-@interface AVAudioPlayer (PVVolumeHook)
-- (void)pv_setVolume:(float)volume;
-@end
-
-@implementation AVAudioPlayer (PVVolumeHook)
-- (void)pv_setVolume:(float)volume {
-    float gain = PVGainForChannel(NO);
-    [self pv_setVolume:fminf(1.0f, fmaxf(0.0f, volume * gain))];
-}
-@end
-
-@interface AVPlayer (PVVolumeHook)
-- (void)pv_setVolume:(float)volume;
-@end
-
-@implementation AVPlayer (PVVolumeHook)
-- (void)pv_setVolume:(float)volume {
-    float gain = PVGainForChannel(NO);
-    [self pv_setVolume:fminf(1.0f, fmaxf(0.0f, volume * gain))];
-}
-@end
-
-static BOOL PVHooksInstalled = NO;
-static void PVInstallHooks(void) {
+static void PVInstall(void) {
     if (PVHooksInstalled) return;
     PVHooksInstalled = YES;
-    PVSwizzleInstanceMethod(AVAudioPlayer.class, @selector(setVolume:), @selector(pv_setVolume:));
-    PVSwizzleInstanceMethod(AVPlayer.class, @selector(setVolume:), @selector(pv_setVolume:));
+    PVAudioPlayers = [NSHashTable weakObjectsHashTable];
+    PVPlayers = [NSHashTable weakObjectsHashTable];
+    PVSwizzle(AVAudioPlayer.class, @selector(setVolume:), @selector(pv_original_setVolume:));
+    PVSwizzle(AVPlayer.class, @selector(setVolume:), @selector(pv_original_setVolume:));
 }
 
-#pragma mark - Control panel
-
-@interface PVPanelController : UIViewController
-@property(nonatomic, strong) UILabel *masterLabel;
-@property(nonatomic, strong) UILabel *leftLabel;
-@property(nonatomic, strong) UILabel *rightLabel;
-@property(nonatomic, strong) UISlider *masterSlider;
-@property(nonatomic, strong) UISlider *leftSlider;
-@property(nonatomic, strong) UISlider *rightSlider;
-@property(nonatomic, strong) UISwitch *enabledSwitch;
-@property(nonatomic, strong) UISwitch *stereoSwitch;
+@interface PVPanel : UIViewController
+@property(nonatomic,strong) UISlider *slider;
+@property(nonatomic,strong) UILabel *valueLabel;
+@property(nonatomic,strong) UISwitch *enabledSwitch;
 @end
-
-@implementation PVPanelController
-
-- (UILabel *)label:(NSString *)text size:(CGFloat)size {
-    UILabel *v = [[UILabel alloc] init];
-    v.text = text;
-    v.font = [UIFont systemFontOfSize:size weight:UIFontWeightSemibold];
-    v.textColor = UIColor.labelColor;
-    v.translatesAutoresizingMaskIntoConstraints = NO;
-    return v;
-}
-
-- (UISlider *)sliderWithValue:(float)value action:(SEL)action {
-    UISlider *s = [[UISlider alloc] init];
-    s.minimumValue = 0.0f;
-    s.maximumValue = 2.0f;
-    s.value = value;
-    s.translatesAutoresizingMaskIntoConstraints = NO;
-    [s addTarget:self action:action forControlEvents:UIControlEventValueChanged];
-    return s;
-}
-
+@implementation PVPanel
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.97];
-    self.view.layer.cornerRadius = 20.0;
-    self.view.layer.borderWidth = 1.0;
-    self.view.layer.borderColor = UIColor.separatorColor.CGColor;
+    self.view.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.98];
+    self.view.layer.cornerRadius = 18;
     self.view.clipsToBounds = YES;
-
-    UILabel *title = [self label:@"PerAppVolume" size:21];
-    UILabel *status = [self label:@"AVAudioPlayer / AVPlayer Hook（有限覆盖）" size:11];
-    status.textColor = UIColor.secondaryLabelColor;
-
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    [close setTitle:@"关闭" forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    close.translatesAutoresizingMaskIntoConstraints = NO;
+    UILabel *title = [[UILabel alloc] init]; title.text = @"PerAppVolume"; title.font = [UIFont boldSystemFontOfSize:21];
+    self.valueLabel = [[UILabel alloc] init]; self.valueLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
+    self.slider = [[UISlider alloc] init]; self.slider.minimumValue = 0; self.slider.maximumValue = 1; self.slider.value = PVGain;
+    [self.slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+    UILabel *switchTitle = [[UILabel alloc] init]; switchTitle.text = @"启用音量控制";
+    self.enabledSwitch = [[UISwitch alloc] init]; self.enabledSwitch.on = PVEnabled;
+    [self.enabledSwitch addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem]; [close setTitle:@"关闭面板" forState:UIControlStateNormal];
     [close addTarget:self action:@selector(closePanel) forControlEvents:UIControlEventTouchUpInside];
-
-    self.masterLabel = [self label:@"" size:15];
-    self.leftLabel = [self label:@"" size:13];
-    self.rightLabel = [self label:@"" size:13];
-    self.masterSlider = [self sliderWithValue:PVMaster action:@selector(masterChanged:)];
-    self.leftSlider = [self sliderWithValue:PVLeft action:@selector(leftChanged:)];
-    self.rightSlider = [self sliderWithValue:PVRight action:@selector(rightChanged:)];
-
-    UILabel *enabledText = [self label:@"启用音量 Hook" size:14];
-    self.enabledSwitch = [[UISwitch alloc] init];
-    self.enabledSwitch.on = PVEnabled;
-    self.enabledSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.enabledSwitch addTarget:self action:@selector(enabledChanged:) forControlEvents:UIControlEventValueChanged];
-
-    UILabel *stereoText = [self label:@"独立左右声道" size:14];
-    self.stereoSwitch = [[UISwitch alloc] init];
-    self.stereoSwitch.on = PVStereo;
-    self.stereoSwitch.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.stereoSwitch addTarget:self action:@selector(stereoChanged:) forControlEvents:UIControlEventValueChanged];
-
-    UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[title, close]];
-    header.axis = UILayoutConstraintAxisHorizontal;
-    header.alignment = UIStackViewAlignmentCenter;
-    header.distribution = UIStackViewDistributionEqualSpacing;
-
-    UIStackView *enabledRow = [[UIStackView alloc] initWithArrangedSubviews:@[enabledText, self.enabledSwitch]];
-    enabledRow.axis = UILayoutConstraintAxisHorizontal;
-    enabledRow.alignment = UIStackViewAlignmentCenter;
-    enabledRow.distribution = UIStackViewDistributionEqualSpacing;
-
-    UIStackView *stereoRow = [[UIStackView alloc] initWithArrangedSubviews:@[stereoText, self.stereoSwitch]];
-    stereoRow.axis = UILayoutConstraintAxisHorizontal;
-    stereoRow.alignment = UIStackViewAlignmentCenter;
-    stereoRow.distribution = UIStackViewDistributionEqualSpacing;
-
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        header, status, self.masterLabel, self.masterSlider,
-        self.leftLabel, self.leftSlider, self.rightLabel, self.rightSlider,
-        enabledRow, stereoRow
-    ]];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 10;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[switchTitle,self.enabledSwitch]]; row.axis=UILayoutConstraintAxisHorizontal; row.distribution=UIStackViewDistributionEqualSpacing;
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[title,self.valueLabel,self.slider,row,close]]; stack.axis=UILayoutConstraintAxisVertical; stack.spacing=18; stack.translatesAutoresizingMaskIntoConstraints=NO;
     [self.view addSubview:stack];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:18],
-        [stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-18],
-        [stack.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:16],
-        [stack.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-16],
-        [self.view.widthAnchor constraintEqualToConstant:340]
-    ]];
-    [self updateLabels];
+    [NSLayoutConstraint activateConstraints:@[[stack.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],[stack.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],[stack.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:20],[stack.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.bottomAnchor constant:-20],[self.view.widthAnchor constraintEqualToConstant:320]]];
+    [self updateValue];
 }
-
-- (void)updateLabels {
-    self.masterLabel.text = [NSString stringWithFormat:@"主音量  %.0f%%", PVMaster * 100.0f];
-    self.leftLabel.text = [NSString stringWithFormat:@"左声道  %.0f%%", PVLeft * 100.0f];
-    self.rightLabel.text = [NSString stringWithFormat:@"右声道  %.0f%%", PVRight * 100.0f];
-    self.leftSlider.enabled = PVStereo;
-    self.rightSlider.enabled = PVStereo;
-}
-
-- (void)masterChanged:(UISlider *)s {
-    PVMaster = PVClamp(s.value);
-    PVSaveSettings();
-    [self updateLabels];
-}
-- (void)leftChanged:(UISlider *)s {
-    PVLeft = PVClamp(s.value);
-    PVSaveSettings();
-    [self updateLabels];
-}
-- (void)rightChanged:(UISlider *)s {
-    PVRight = PVClamp(s.value);
-    PVSaveSettings();
-    [self updateLabels];
-}
-- (void)enabledChanged:(UISwitch *)s {
-    PVEnabled = s.on;
-    PVSaveSettings();
-}
-- (void)stereoChanged:(UISwitch *)s {
-    PVStereo = s.on;
-    PVSaveSettings();
-    [self updateLabels];
-}
-- (void)closePanel {
-    self.view.window.hidden = YES;
-}
-
+- (void)updateValue { self.valueLabel.text=[NSString stringWithFormat:@"音量倍率：%.0f%%（最高 100%%）",PVGain*100.0f]; }
+- (void)sliderChanged:(UISlider *)s { PVGain=PVClamp(s.value); PVSave(); [self updateValue]; PVRefreshPlayers(); }
+- (void)switchChanged:(UISwitch *)s { PVEnabled=s.on; PVSave(); PVRefreshPlayers(); }
+- (void)closePanel { self.view.window.hidden=YES; }
 @end
 
-static UIWindow *PVWindow = nil;
-static UIButton *PVOpenButton = nil;
-
-static UIWindowScene *PVActiveScene(void) {
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class] &&
-            scene.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene *)scene;
-        }
-    }
+static UIWindow *PVWindow;
+static UIWindowScene *PVScene(void) {
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
+        if ([s isKindOfClass:UIWindowScene.class] && s.activationState==UISceneActivationStateForegroundActive) return (UIWindowScene *)s;
     return nil;
 }
-
 static void PVShowPanel(void) {
-    if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{ PVShowPanel(); });
-        return;
-    }
-    UIWindowScene *scene = PVActiveScene();
-    if (!scene) return;
-
-    if (!PVWindow) {
-        PVWindow = [[UIWindow alloc] initWithWindowScene:scene];
-        PVWindow.windowLevel = UIWindowLevelAlert + 1;
-        PVWindow.backgroundColor = UIColor.clearColor;
-        PVWindow.rootViewController = [[PVPanelController alloc] init];
-        PVWindow.frame = CGRectMake(0, 0, 340, 360);
-    }
-    PVWindow.hidden = NO;
-    PVWindow.alpha = 1.0;
-    PVWindow.rootViewController.view.hidden = NO;
-    PVWindow.center = CGPointMake(scene.coordinateSpace.bounds.size.width / 2.0,
-                                  scene.coordinateSpace.bounds.size.height / 2.0);
-    [PVWindow makeKeyAndVisible];
+    if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ PVShowPanel(); }); return; }
+    UIWindowScene *scene=PVScene(); if (!scene) return;
+    if (!PVWindow) { PVWindow=[[UIWindow alloc] initWithWindowScene:scene]; PVWindow.windowLevel=UIWindowLevelAlert; PVWindow.backgroundColor=UIColor.clearColor; PVWindow.rootViewController=[PVPanel new]; }
+    PVWindow.frame=CGRectMake(0,0,320,260); PVWindow.center=CGPointMake(CGRectGetMidX(scene.coordinateSpace.bounds),CGRectGetMidY(scene.coordinateSpace.bounds)); PVWindow.hidden=NO; [PVWindow makeKeyAndVisible];
 }
-
-static void PVShowStartupAlert(void) {
-    if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{ PVShowStartupAlert(); });
-        return;
-    }
-    UIWindowScene *scene = PVActiveScene();
-    if (!scene) return;
-    UIViewController *presenter = scene.windows.firstObject.rootViewController;
-    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-    if (!presenter || !presenter.view.window) return;
-
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"PerAppVolume 已初始化"
-        message:@"动态库初始化成功。\n已安装 AVAudioPlayer / AVPlayer 音量 Hook。\n注意：这不代表所有音频路径均可控制；当前增益上限受系统播放器音量范围限制。"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"打开控制面板"
-        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-            PVShowPanel();
-        }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定"
-        style:UIAlertActionStyleCancel handler:nil]];
-    [presenter presentViewController:alert animated:YES completion:nil];
+static void PVShowAlert(void) {
+    UIWindowScene *scene=PVScene(); if (!scene) return;
+    UIWindow *w=nil; for (UIWindow *candidate in scene.windows) if (candidate.rootViewController && !candidate.hidden) { w=candidate; break; }
+    UIViewController *vc=w.rootViewController; while (vc.presentedViewController) vc=vc.presentedViewController;
+    if (!vc || !vc.view.window) return;
+    UIAlertController *a=[UIAlertController alertControllerWithTitle:@"PerAppVolume 已加载" message:@"当前支持 AVAudioPlayer / AVPlayer 的音量属性。仅支持 0–100%，不支持所有音频引擎或左右声道独立处理。" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"打开控制面板" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *x){ PVShowPanel(); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleCancel handler:nil]];
+    [vc presentViewController:a animated:YES completion:nil];
 }
-
-__attribute__((constructor))
-static void PerAppVolumeInitialize(void) {
-    @autoreleasepool {
-        PVLoadSettings();
-        PVInstallHooks();
-        NSLog(@"[PerAppVolume] initialized; AVAudioPlayer and AVPlayer hooks installed");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            // Delay until the host app has a foreground window.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                PVShowStartupAlert();
-            });
-        });
-    }
+__attribute__((constructor)) static void PerAppVolumeInitialize(void) {
+    @autoreleasepool { PVLoad(); PVInstall(); NSLog(@"[PerAppVolume] AVFoundation volume hooks installed"); dispatch_async(dispatch_get_main_queue(), ^{ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ PVShowAlert(); }); }); }
 }
