@@ -1,0 +1,90 @@
+name: Build PerAppVolume
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bash \
+            curl \
+            git \
+            make \
+            clang \
+            perl \
+            python3 \
+            xz-utils \
+            unzip
+
+      - name: Install Theos
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+
+      - name: Verify Theos
+        run: |
+          echo "=== THEOS ==="
+          echo "$THEOS"
+
+          test -d "$THEOS"
+          test -f "$THEOS/makefiles/common.mk"
+
+          echo "[PASS] Theos installed"
+
+      - name: Show available SDKs
+        run: |
+          echo "=== SDKs ==="
+          find "$THEOS/sdks" -maxdepth 1 -type d -name "*.sdk" -print || true
+
+      - name: Build
+        run: |
+          test -f Makefile || {
+            echo "::error::Makefile not found"
+            exit 1
+          }
+
+          make clean || true
+          make package FINALPACKAGE=1
+
+      - name: Verify build output
+        run: |
+          echo "=== Output files ==="
+          find . -type f \
+            \( -name "*.dylib" -o -name "*.deb" \) \
+            -print
+
+          DYLIB=$(find . -type f -name "*.dylib" | head -1)
+
+          if [ -z "$DYLIB" ]; then
+            echo "::error::No dylib was produced"
+            exit 1
+          fi
+
+          echo "Testing:"
+          echo "$DYLIB"
+
+          file "$DYLIB"
+
+          if file "$DYLIB" | grep -q "Mach-O"; then
+            echo "[PASS] Apple Mach-O detected"
+          else
+            echo "::error::Output is NOT an Apple Mach-O binary"
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerAppVolume-build
+          path: |
+            packages/*
+            .theos/obj/**/*.dylib
+          if-no-files-found: error
